@@ -1,0 +1,49 @@
+"""Lectura del formato CIMG1 de la Cripto App."""
+
+from __future__ import annotations
+
+import json
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+
+MAGIC = b"CIMG1"
+HEADER_LEN_SIZE = 4
+
+
+class AttackError(Exception):
+    """Error controlado de la aplicación de ataques."""
+
+
+@dataclass(frozen=True)
+class EncryptedPackage:
+    header: dict
+    ciphertext: bytes
+
+
+def unpack_encrypted_file(path: str | Path) -> EncryptedPackage:
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        raise AttackError("El archivo cifrado seleccionado no existe.")
+
+    data = path.read_bytes()
+    if len(data) < len(MAGIC) + HEADER_LEN_SIZE or not data.startswith(MAGIC):
+        raise AttackError("El archivo no parece haber sido generado por la Cripto App original.")
+
+    offset = len(MAGIC)
+    header_len = struct.unpack(">I", data[offset : offset + HEADER_LEN_SIZE])[0]
+    offset += HEADER_LEN_SIZE
+
+    header_bytes = data[offset : offset + header_len]
+    ciphertext = data[offset + header_len :]
+
+    try:
+        header = json.loads(header_bytes.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise AttackError("El encabezado del archivo cifrado no es válido.") from exc
+
+    return EncryptedPackage(header=header, ciphertext=ciphertext)
+
+
+def get_algorithm(path: str | Path) -> str:
+    return unpack_encrypted_file(path).header.get("algorithm", "").upper().strip()

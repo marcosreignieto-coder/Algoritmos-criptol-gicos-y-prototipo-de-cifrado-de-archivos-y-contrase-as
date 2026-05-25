@@ -1,0 +1,126 @@
+"""Utilidades internas para probar contraseñas en paralelo.
+
+La interfaz no muestra esta implementación: solo recibe estadísticas.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from itertools import islice
+from typing import Callable, Iterable, Iterator, Optional, TypeVar
+
+from ..config import MAX_WORKERS, SEARCH_CHUNK_SIZE
+from ..stats import AttackStats
+
+T = TypeVar("T")
+R = TypeVar("R")
+
+ProgressCallback = Optional[Callable[[AttackStats, str], None]]
+StopCallback = Optional[Callable[[], bool]]
+
+
+def _chunks(iterator: Iterator[T], size: int) -> Iterator[list[T]]:
+    while True:
+        chunk = list(islice(iterator, size))
+        if not chunk:
+            break
+        yield chunk
+
+
+def search_parallel(
+    candidates: Iterable[T],
+    tester: Callable[[T], Optional[R]],
+    progress_callback: ProgressCallback = None,
+    stop_callback: StopCallback = None,
+    current_prefix: str = "probando",
+    chunk_size: int = SEARCH_CHUNK_SIZE,
+    max_workers: int = MAX_WORKERS,
+) -> tuple[Optional[R], AttackStats, Optional[T]]:
+    """Busca el primer candidato válido usando lotes y varios hilos.
+
+    Devuelve: resultado encontrado, estadísticas finales y último candidato probado.
+    """
+    stats = AttackStats()
+    start = time.perf_counter()
+    last_update = start
+    last_count = 0
+    last_candidate: Optional[T] = None
+    found_event = threading.Event()
+
+    iterator = iter(candidates)
+
+    def run_chunk(chunk: list[T]) -> tuple[Optional[R], int, Optional[T]]:
+        local_last = None
+        tested = 0
+        for candidate in chunk:
+            if found_event.is_set() or (stop_callback and stop_callback()):
+                return None, tested, local_last
+            local_last = candidate
+            tested += 1
+            result = tester(candidate)
+            if result is not None:
+                found_event.set()
+                return result, tested, local_last
+        return None, tested, local_last
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        chunk_iter = _chunks(iterator, chunk_size)
+        pending = set()
+
+        def submit_until_full() -> None:
+            while len(pending) < max_workers * 2 and not found_event.is_set():
+                if stop_callback and stop_callback():
+                    return
+                try:
+                    chunk = next(chunk_iter)
+                except StopIteration:
+                    return
+                pending.add(executor.submit(run_chunk, chunk))
+
+        submit_until_full()
+        found_result: Optional[R] = None
+
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                result, tested, candidate = future.result()
+                stats.total_tests += tested
+                if candidate is not None:
+                    last_candidate = candidate
+
+                now = time.perf_counter()
+                if now - last_update >= 0.15 or result is not None:
+                    interval = max(now - last_update, 1e-9)
+                    stats.elapsed = now - start
+                    stats.current_rate = (stats.total_tests - last_count) / interval
+                    stats.average_rate = stats.total_tests / max(stats.elapsed, 1e-9)
+                    if stats.current_rate > 0:
+                        stats.min_rate = stats.current_rate if stats.min_rate == 0 else min(stats.min_rate, stats.current_rate)
+                        stats.max_rate = max(stats.max_rate, stats.current_rate)
+                    last_update = now
+                    last_count = stats.total_tests
+                    if progress_callback:
+                        progress_callback(stats, f"{current_prefix} {last_candidate}")
+
+                if result is not None:
+                    found_result = result
+                    found_event.set()
+                    break
+
+            if found_result is not None:
+                break
+            submit_until_full()
+
+    stats.elapsed = time.perf_counter() - start
+    stats.average_rate = stats.total_tests / max(stats.elapsed, 1e-9)
+    if stats.current_rate == 0 and stats.total_tests:
+        stats.current_rate = stats.average_rate
+    if stats.min_rate == 0 and stats.total_tests:
+        stats.min_rate = stats.average_rate
+    if stats.max_rate == 0 and stats.total_tests:
+        stats.max_rate = stats.average_rate
+    if progress_callback:
+        progress_callback(stats, f"{current_prefix} {last_candidate or '-'}")
+    return found_result, stats, last_candidate

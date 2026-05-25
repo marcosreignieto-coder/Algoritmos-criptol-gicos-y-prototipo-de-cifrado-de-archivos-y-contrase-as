@@ -1,0 +1,40 @@
+"""Ataque con claves recurrentes.
+
+Prueba primero contraseñas muy habituales y específicas del proyecto.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable, Optional
+
+from ..stats import AttackResult, AttackStats
+from .candidatos import recurrent_passwords, unique
+from .password_attack import attack_password_candidates
+
+ProgressCallback = Optional[Callable[[AttackStats, str], None]]
+StopCallback = Optional[Callable[[], bool]]
+
+
+def attack_recurrent(
+    encrypted_path: str | Path,
+    output_dir: str | Path,
+    progress_callback: ProgressCallback = None,
+    stop_callback: StopCallback = None,
+    min_password_len: int | None = None,
+    max_password_len: int | None = None,
+    password_type_filter: str | None = None,
+    max_iterations: int | None = None,
+) -> AttackResult:
+    return attack_password_candidates(
+        encrypted_path,
+        output_dir,
+        unique(recurrent_passwords()),
+        "claves recurrentes",
+        progress_callback,
+        stop_callback,
+        min_password_len,
+        max_password_len,
+        password_type_filter,
+        max_iterations,
+    )
